@@ -21,6 +21,8 @@ from transformers.cache_utils import Cache, DynamicCache, EncoderDecoderCache, S
 from transformers.utils import is_torchdynamo_compiling
 from torch import Tensor
 
+from transformers import XLNetTokenizerFast
+
 class T5LayerNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -137,6 +139,61 @@ class T5Attention(nn.Module):
 
         self.gradient_checkpointing = False
 
+    # @staticmethod
+    # def _relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128, max_exact=None):
+    #     """
+    #     Adapted from Mesh Tensorflow:
+    #     https://github.com/tensorflow/mesh/blob/0cb87fe07da627bf0b7e60475d59f95ed6b5be3d/mesh_tensorflow/transformer/transformer_layers.py#L593
+    #     Translate relative position to a bucket number for relative attention. The relative position is defined as
+    #     memory_position - query_position, i.e. the distance in tokens from the attending position to the attended-to
+    #     position. If bidirectional=False, then positive relative positions are invalid. We use smaller buckets for
+    #     small absolute relative_position and larger buckets for larger absolute relative_positions. All relative
+    #     positions >=max_distance map to the same bucket. All relative positions <=-max_distance map to the same bucket.
+    #     This should allow for more graceful generalization to longer sequences than the model has been trained on
+    #     Args:
+    #         relative_position: an int32 Tensor
+    #         bidirectional: a boolean - whether the attention is bidirectional
+    #         num_buckets: an integer
+    #         max_distance: an integer
+    #     Returns:
+    #         a Tensor with the same shape as relative_position, containing int32 values in the range [0, num_buckets)
+    #     """
+        
+    #     relative_buckets = 0
+    #     if bidirectional:
+    #         num_buckets //= 2
+            
+    #         if max_exact==None or max_exact>num_buckets // 2:
+    #             max_exact = num_buckets // 2
+            
+    #         relative_buckets += (relative_position
+    #                              > 0).to(torch.long) * num_buckets
+    #         relative_position = torch.abs(relative_position)
+    #     else:
+    #         raise ValueError("NOT IMPLEMENTED: UNI-DIRECTIONAL POSITION BUCKETS")
+    #         relative_position = - \
+    #             torch.min(relative_position,
+    #                       torch.zeros_like(relative_position))
+    #     # now relative_position is in the range [0, inf)
+
+    #     # half of the buckets are for exact increments in positions
+        
+    #     is_small = relative_position < max_exact
+
+    #     # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
+    #     relative_position_if_large = max_exact + (
+    #         torch.log(relative_position.float() / max_exact)
+    #         / math.log(max_distance / max_exact)
+    #         * (num_buckets - max_exact)
+    #     ).to(torch.long)
+    #     relative_position_if_large = torch.min(
+    #         relative_position_if_large, torch.full_like(
+    #             relative_position_if_large, num_buckets - 1)
+    #     )
+
+    #     relative_buckets += torch.where(is_small,
+    #                                     relative_position, relative_position_if_large)
+    #     return relative_buckets
     @staticmethod
     def _relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128):
         """
@@ -209,24 +266,28 @@ class T5Attention(nn.Module):
         values = values.permute([2, 0, 1]).unsqueeze(0)
         return values
 
-    def compute_vertical_horizontal_bias(self, total_boxes: int = 512, device=None):
-
+    def compute_vertical_horizontal_bias(self, total_boxes: int = 512, device=None, distances = None):
+        # distances shape: 2,b,num_tokens,num_tokens
         denominator_to_divide = total_boxes // self.relative_attention_num_buckets
 
         """Compute the vertical and horizontal bias"""
         if device is None:
             device = self.relative_attention_bias.weight.device
-        indices = torch.arange(total_boxes, dtype=torch.long, device=device)
-        h_distances = (indices % self.relative_attention_num_buckets)[
-            :, None] - (indices % self.relative_attention_num_buckets)[None, :]
-        v_distances = (
-            indices // denominator_to_divide)[:, None] - (indices // denominator_to_divide)[None, :]
-
+        # print(distances)
+        if distances==None:
+            raise ValueError("Horizontal and Vertical distances expected, but not provided")
+            indices = torch.arange(total_boxes, dtype=torch.long, device=device)
+            h_distances = (indices % self.relative_attention_num_buckets)[
+                :, None] - (indices % self.relative_attention_num_buckets)[None, :]
+            v_distances = (
+                indices // denominator_to_divide)[:, None] - (indices // denominator_to_divide)[None, :]
+        else:
+            h_distances, v_distances = distances
         h_distances_bucket = self._relative_position_bucket(
             h_distances,  # shape (query_length, key_length)
             bidirectional=(not self.is_decoder),
             num_buckets=self.relative_attention_num_buckets,
-            max_distance=self.relative_attention_max_distance,
+            max_distance=1000,
         )
         
         ## It has to be like this : https://github.com/microsoft/i-Code/blob/d933ae53eb9dec057e605fa4c89ea701629c5b9d/i-Code-Doc/core/models/embedding/relative/relative.py#L175
@@ -235,23 +296,21 @@ class T5Attention(nn.Module):
             v_distances,  # shape (query_length, key_length)
             bidirectional=(not self.is_decoder),
             num_buckets=self.relative_attention_num_buckets,
-            max_distance=self.relative_attention_max_distance,
+            max_distance=1000,
         )
-
+        # print("h_distances_bucket:", h_distances_bucket.shape)
         h_distances_values = self.relative_horizontal_bias(
             h_distances_bucket)  # shape (query_length, key_length, num_heads)
-        h_distances_values = h_distances_values.permute([2, 0, 1]).unsqueeze(
-            0)  # shape (1, num_heads, query_length, key_length)
+        h_distances_values = h_distances_values.permute([0,3, 1, 2])  # shape (batch_size, num_heads, query_length, key_length)
 
         v_distances_values = self.relative_vertical_bias(
             v_distances_bucket)  # shape (query_length, key_length, num_heads)
-        v_distances_values = v_distances_values.permute([2, 0, 1]).unsqueeze(
-            0)  # shape (1, num_heads, query_length, key_length)
+        v_distances_values = v_distances_values.permute([0, 3, 1, 2])  # shape (batch_size, num_heads, query_length, key_length)
 
         return h_distances_values, v_distances_values
 
     def forward(self, hidden_states, mask=None, key_value_states=None, position_bias=None, past_key_value=None, layer_head_mask=None, query_length=None,
-                use_cache=False, output_attentions=False):
+                use_cache=False, output_attentions=False, distances=None):
         """
         Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
         """
@@ -331,7 +390,8 @@ class T5Attention(nn.Module):
                 position_bias = self.compute_bias_1d(
                     real_seq_length, key_length, device=scores.device)
                 h_distances_values, v_distances_values = self.compute_vertical_horizontal_bias(
-                    total_boxes=real_seq_length, device=scores.device)
+                    total_boxes=real_seq_length, device=scores.device, distances=distances)
+                # print("<>"*10, position_bias.shape, h_distances_values.shape, h_distances_values)
                 position_bias = position_bias + h_distances_values + v_distances_values
 
             # if key and values are already calculated
@@ -344,7 +404,7 @@ class T5Attention(nn.Module):
                 position_bias = position_bias + mask
 
         position_bias_masked = position_bias  # No pruning right now
-
+        # print("{}"*10,scores.shape)
         scores += position_bias_masked
         attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
             scores
@@ -380,10 +440,10 @@ class T5LayerSelfAttention(nn.Module):
             config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, hidden_states, attention_mask=None, position_bias=None, layer_head_mask=None, past_key_value=None, use_cache=False, output_attentions=False):
+    def forward(self, hidden_states, attention_mask=None, position_bias=None, layer_head_mask=None, past_key_value=None, use_cache=False, output_attentions=False, distances=None):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.SelfAttention(normed_hidden_states, mask=attention_mask, position_bias=position_bias,
-                                              layer_head_mask=layer_head_mask, past_key_value=past_key_value, use_cache=use_cache, output_attentions=output_attentions,)
+                                              layer_head_mask=layer_head_mask, past_key_value=past_key_value, use_cache=use_cache, output_attentions=output_attentions,distances=distances)
         hidden_states = hidden_states + self.dropout(attention_output[0])
         # add attentions if we output them
         outputs = (hidden_states,) + attention_output[1:]
@@ -430,7 +490,7 @@ class CustomT5Block(nn.Module):
 
     def forward(self, hidden_states, attention_mask=None, position_bias=None, encoder_hidden_states=None,
                 encoder_attention_mask=None, encoder_decoder_position_bias=None, layer_head_mask=None, cross_attn_layer_head_mask=None,
-                past_key_value=None, use_cache=False, output_attentions=False, return_dict=True, cache_position=None):
+                past_key_value=None, use_cache=False, output_attentions=False, return_dict=True, cache_position=None, distances=None):
 
         assert (type(hidden_states)==tuple and len(hidden_states)==2)
         image_embeds = hidden_states[0]
@@ -458,6 +518,7 @@ class CustomT5Block(nn.Module):
             past_key_value=self_attn_past_key_value,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            distances=distances
         )
         hidden_states, present_key_value_state = self_attention_outputs[:2]
         # Keep self-attention outputs and relative position weights
@@ -515,7 +576,7 @@ class CustomT5Block(nn.Module):
                 hidden_states, min=-clamp_value, max=clamp_value)
         
         ## fusion
-        self.fusion(hidden_states, image_embeds)
+        hidden_states = self.fusion(hidden_states, image_embeds)
 
         outputs = (hidden_states,)
 
@@ -615,6 +676,7 @@ class CustomT5Stack(t5.modeling_t5.T5Stack):
         output_hidden_states=None,
         return_dict=None,
         cache_position=None,
+        distances=None
     ):
         image_embeds=None
         if inputs_embeds!=None:
@@ -777,6 +839,7 @@ class CustomT5Stack(t5.modeling_t5.T5Stack):
                     output_attentions,
                     return_dict,
                     cache_position,
+                    distances=distances
                 )
             else:
                 layer_outputs = layer_module(
@@ -793,6 +856,7 @@ class CustomT5Stack(t5.modeling_t5.T5Stack):
                     output_attentions=output_attentions,
                     return_dict=return_dict,
                     cache_position=cache_position,
+                    distances=distances
                 )
 
             # layer_outputs is a tuple with:
@@ -914,6 +978,33 @@ class CustomT5EncoderModel(T5EncoderModel):
         # Model parallel
         self.model_parallel = False
         self.device_map = None
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        distances = None
+    ) -> Union[Tuple[torch.FloatTensor], BaseModelOutput]:
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            distances=distances
+        )
+
+        return encoder_outputs
 
 
 class T5ForTokenClassification(T5PreTrainedModel):
@@ -943,6 +1034,7 @@ class T5ForTokenClassification(T5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        distances = None
     ) -> Union[Tuple[torch.Tensor], TokenClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -950,7 +1042,7 @@ class T5ForTokenClassification(T5PreTrainedModel):
         Returns:
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        assert input_ids==None
         outputs = self.transformer(
             input_ids,
             attention_mask=attention_mask,
@@ -959,6 +1051,7 @@ class T5ForTokenClassification(T5PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            distances=distances
         )
 
         hidden_states = outputs[0]
