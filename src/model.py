@@ -1,4 +1,4 @@
-from javis_t5 import T5ForTokenClassification
+from javis_t5 import T5ForTokenClassification, TripleHeadTILTForTokenClassification
 from ernie_visual_backbone import ResNetCustomized
 from transformers import AutoTokenizer, AutoConfig
 from datasets import load_dataset
@@ -35,11 +35,11 @@ class VisualEmbedding(nn.Module):
     return projection
 
 class TiLTTransformer(nn.Module):
-  def __init__(self, config, num_labels):
+  def __init__(self, config, num_labels_0, num_labels_1, num_labels_2):
     super().__init__()
     self.config = config
     self.visual_embedding_extractor = VisualEmbedding(config)
-    self.t5_model = T5ForTokenClassification(config, num_labels)
+    self.t5_model = TripleHeadTILTForTokenClassification(config, num_labels_0, num_labels_1, num_labels_2)
     if self.config.load_vision_weights:
       checkpoint = torch.load("src/unet_encoder_weights.pth")
       self.visual_embedding_extractor.unet_encoder.load_state_dict(checkpoint)
@@ -80,7 +80,7 @@ class TiLTTransformer(nn.Module):
 
     ## This is then fed to t5_model
     final_output = self.t5_model(attention_mask = batch['attention_mask'], inputs_embeds = total_embedding,
-                            labels = batch['labels'], distances = batch["distances"])
+                            labels_1 = batch['labels_1'], labels_2 = batch['labels_2'], labels_3 = batch['labels_3'], distances = batch["distances"])
 
     return final_output
   
