@@ -21,20 +21,25 @@ class VisualEmbedding(nn.Module):
     self.proj = nn.Linear(in_features = 256 * 3 * 3, out_features = config.d_model)
     self.config = config
 
-  def forward(self, pixel_values, bboxes):
-    image_embedding = self.unet_encoder(pixel_values)
-    print(image_embedding.shape)
-    feature_maps_bboxes = self.roi_pool(image_embedding, bboxes).flatten(2)
+  def forward(self, pixel_values, bboxes, overflow):
+    num_imgs = pixel_values.shape
+    image_embeddings = self.unet_encoder(pixel_values)
+    print(image_embeddings.shape)
+    feature_maps_bboxes = []
+    for i, index in enumerate(overflow):
+        image_embedding = image_embeddings[index:index+1]
+        feature_maps_bboxes.append(self.roi_pool(image_embedding, bboxes[i:i+1]).flatten(2))
+    feature_maps_bboxes=torch.concat(feature_maps_bboxes)
     print(feature_maps_bboxes.shape, self.config.d_model, bboxes.shape)
     projection = self.proj(feature_maps_bboxes)
     return projection
 
 class TiLTTransformer(nn.Module):
-  def __init__(self, config):
+  def __init__(self, config, num_labels):
     super().__init__()
     self.config = config
     self.visual_embedding_extractor = VisualEmbedding(config)
-    self.t5_model = T5ForTokenClassification(config, 3)
+    self.t5_model = T5ForTokenClassification(config, num_labels)
     if self.config.load_vision_weights:
       checkpoint = torch.load("src/unet_encoder_weights.pth")
       self.visual_embedding_extractor.unet_encoder.load_state_dict(checkpoint)
@@ -57,7 +62,8 @@ class TiLTTransformer(nn.Module):
 
   def common_step(self, batch):
     ## Visual embedding
-    visual_embedding = self.visual_embedding_extractor(pixel_values = batch['pixel_values'], bboxes = batch['bboxes'])
+    visual_embedding = self.visual_embedding_extractor(pixel_values = batch['pixel_values'], bboxes = batch['bboxes'], overflow = batch["overflow_to_sample_mapping"]
+)
 
     ## Semantic embedding from t5_model's embedding layer
     semantic_embedding = self.t5_model.shared(batch['input_ids'])
@@ -68,7 +74,7 @@ class TiLTTransformer(nn.Module):
     return total_embedding
 
   def forward(self, batch):
-
+    batch["bboxes"]=batch["bbox"]
     total_embedding = self.common_step(batch)
     if batch["distances"]==None:
       batch["distances"] = self.compute_horizontal_vertical_distances(batch["bboxes"])
@@ -94,7 +100,32 @@ class CustomAutoProcessor(ProcessorMixin):
 
         # Process text if provided
         if text is not None:
-            inputs.update(self.tokenizer(text, return_tensors=return_tensors, **kwargs))
+            text_inputs = self.tokenizer(text, **kwargs)
+            overflow_mapping = text_inputs["overflow_to_sample_mapping"]
+            labels = kwargs["word_labels"]
+            if labels!=None:
+                assert len(kwargs["boxes"])==len(labels)
+                boxes = kwargs.get("boxes", None)
+                updated_labels = []
+                for i, overflow_idx in enumerate(overflow_mapping):
+                    original_boxes = boxes[overflow_idx]
+                    original_labels = labels[overflow_idx]
+
+                    # Create bbox-to-label mapping for the current original sample
+                    bbox_label_map = {str(bbox): label for bbox, label in zip(original_boxes, original_labels)}
+
+                    # Update labels for the current tokenized sequence
+                    example_labels = []
+                    for label, bbox in zip(text_inputs["labels"][i], text_inputs["bbox"][i]):
+                        if label == -100 and bbox != [0, 0, 0, 0]:
+                            example_labels.append(bbox_label_map.get(str(bbox), label))
+                        else:
+                            example_labels.append(label)
+                    updated_labels.append(example_labels)
+
+                # Update the labels in the tokenizer outputs
+                text_inputs["labels"] = updated_labels
+            inputs.update(text_inputs)
 
         # Process images if provided
         if images is not None:
@@ -102,4 +133,10 @@ class CustomAutoProcessor(ProcessorMixin):
             # print(pixel_values)
             inputs["pixel_values"] = pixel_values['pixel_values']
 
+        inputs["input_ids"] = torch.tensor(inputs["input_ids"], dtype=torch.long)
+        inputs["attention_mask"] = torch.tensor(inputs["attention_mask"], dtype=torch.long)
+        inputs["bbox"] = torch.tensor(inputs["bbox"], dtype=torch.float32)
+        inputs["pixel_values"] = torch.tensor(inputs["pixel_values"], dtype=torch.float32)
+        inputs["labels"] = torch.tensor(inputs["labels"], dtype=torch.long)
         return inputs
+
