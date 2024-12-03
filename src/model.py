@@ -21,13 +21,13 @@ class VisualEmbedding(nn.Module):
     self.proj = nn.Linear(in_features = 256 * 3 * 3, out_features = config.d_model)
     self.config = config
 
-  def forward(self, pixel_values, bboxes, overflow):
-    num_imgs = pixel_values.shape
+  def forward(self, pixel_values, bboxes):
+    num_imgs = pixel_values.shape[0]
     image_embeddings = self.unet_encoder(pixel_values)
     print(image_embeddings.shape)
     feature_maps_bboxes = []
-    for i, index in enumerate(overflow):
-        image_embedding = image_embeddings[index:index+1]
+    for i in range(num_imgs):
+        image_embedding = image_embeddings[i:i+1]
         feature_maps_bboxes.append(self.roi_pool(image_embedding, bboxes[i:i+1]).flatten(2))
     feature_maps_bboxes=torch.concat(feature_maps_bboxes)
     print(feature_maps_bboxes.shape, self.config.d_model, bboxes.shape)
@@ -62,8 +62,7 @@ class TiLTTransformer(nn.Module):
 
   def common_step(self, batch):
     ## Visual embedding
-    visual_embedding = self.visual_embedding_extractor(pixel_values = batch['pixel_values'], bboxes = batch['bboxes'], overflow = batch["overflow_to_sample_mapping"]
-)
+    visual_embedding = self.visual_embedding_extractor(pixel_values = batch['pixel_values'], bboxes = batch['bboxes'])
 
     ## Semantic embedding from t5_model's embedding layer
     semantic_embedding = self.t5_model.shared(batch['input_ids'])
@@ -131,12 +130,12 @@ class CustomAutoProcessor(ProcessorMixin):
         if images is not None:
             pixel_values = self.image_processor(images, return_tensors=return_tensors)
             # print(pixel_values)
-            inputs["pixel_values"] = pixel_values['pixel_values']
+            inputs["pixel_values"] = [pixel_values['pixel_values'][i] for i in inputs["overflow_to_sample_mapping"]]
 
         inputs["input_ids"] = torch.tensor(inputs["input_ids"], dtype=torch.long)
         inputs["attention_mask"] = torch.tensor(inputs["attention_mask"], dtype=torch.long)
         inputs["bbox"] = torch.tensor(inputs["bbox"], dtype=torch.float32)
-        inputs["pixel_values"] = torch.tensor(inputs["pixel_values"], dtype=torch.float32)
+        inputs["pixel_values"] = torch.stack(inputs["pixel_values"])
         inputs["labels"] = torch.tensor(inputs["labels"], dtype=torch.long)
         return inputs
 
